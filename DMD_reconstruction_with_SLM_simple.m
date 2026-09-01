@@ -1,0 +1,402 @@
+%% ========================================================
+% SLM SUPERPIXEL — DIRECT PHASE ENCODING
+%
+% Simplified approach: the SLM directly encodes the superpixel
+% phase map.  Each SLM pixel = one virtual DMD micro-mirror.
+%
+%   Superpixel (4x4 pixels):
+%   ┌───────────────────────────┐
+%   │  0   π/8  2π/8  3π/8     │
+%   │ 4π/8 5π/8 6π/8  7π/8     │
+%   │ 8π/8 9π/8 10π/8 11π/8    │
+%   │12π/8 13π/8 14π/8 15π/8   │
+%   └───────────────────────────┘
+%
+%   ON  mirror at (iy2,ix2)  ->  SLM pixel phase = phases(iy2,ix2)
+%   OFF mirror               ->  SLM pixel phase = phi_off
+%
+% Since the phase of each pixel is directly programmed, the aperture
+% is placed at DC (centred, NO decentering needed).
+% The aperture acts only as a low-pass spatial filter.
+%
+% Comparison with the blaze-based approach (DMD_reconstruction_with_SLM):
+%   - Simpler : no SLM_per_DMD, no carrier correction, no decentering
+%   - Less efficient : OFF pixels still reach the aperture (phase_off ≠ 0)
+%   - Direct : the LUT IS the set of complex phasors summed by the aperture
+%% ========================================================
+
+clear; close all; clc;
+
+%% ========================================================
+% PARAMETERS
+%% ========================================================
+
+Nsp    = 100;        % number of superpixels per axis
+n      = 4;          % superpixel size (n x n SLM pixels = n x n mirrors)
+lambda = 633e-9;     % wavelength [m]
+
+SLM_pitch = 17e-6;  % SLM pixel pitch [m] (info only, not used in sim)
+
+%% ========================================================
+% APERTURE  (centred at DC, no decentering)
+%% ========================================================
+
+r = 0.065;    % radius [normalised frequency units, cycles/pixel]
+              % rule of thumb : r < 1/(2*n) = 0.125 so individual
+              % pixels cannot be resolved (superpixel acts as a unit)
+f_L2=200e-3;
+r_physique = r * lambda * f_L2 / SLM_pitch*1000 %m
+         %  = 0.48 mm  %(rayon du pinhole à insérer dans ton banc)              
+%% ========================================================
+% OFF-PIXEL PHASE
+%
+% For a pure phase SLM, OFF pixels cannot be truly blocked.
+% phi_off = 0       : OFF pixels add a real offset to the field
+%                     (shifts the LUT cloud toward +Re axis)
+% phi_off = random  : OFF contributions average toward zero
+%                     (cleaner LUT, set use_random_off = true)
+%% ========================================================
+
+use_random_off = true;   % set true for random OFF phases
+
+if use_random_off
+    phi_off_map = 2*pi * rand(n,n);   % random per mirror, fixed for LUT
+else
+    phi_off_map = zeros(n,n);         % all OFF -> phase 0
+end
+
+%% ========================================================
+% SUPERPIXEL PHASE MAP  (the 16 uniformly distributed phases)
+%
+%   phases(iy2,ix2) = 2*pi * k / n^2   with k = 0..n^2-1
+%   arranged in column-major order (MATLAB default for reshape).
+%
+%   Neighbours in y  : delta_phi = 2*pi / n^2  (= pi/8  for n=4)
+%   Neighbours in x  : delta_phi = 2*pi / n    (= pi/2  for n=4)
+%% ========================================================
+
+phases = reshape(2*pi*(0:n^2-1)/n^2, n, n);
+
+fprintf('Phase map (multiples of pi/8):\n')
+disp(round(phases / (pi/8)))
+
+%% ========================================================
+% TARGET FIELD
+%
+% Choose one of the targets below.
+% The LUT spans a DISK in the complex plane, so both amplitude
+% and phase can be controlled simultaneously.
+%% ========================================================
+
+%target_mode = 'turbulence';
+% target_mode = 'turbulence';   % pure phase only, |E|=1
+target_mode = 'image';        % arbitrary amplitude + phase
+
+%% --- Kolmogorov turbulence (pure phase, |E| = 1) ---
+fx_t = (-Nsp/2:Nsp/2-1) / Nsp;
+[FXt, FYt] = meshgrid(fx_t, fx_t);
+ft = sqrt(FXt.^2 + FYt.^2);
+ft(ft==0) = 1e-6;
+PSD = ft.^(-11/3);
+cn  = randn(Nsp) + 1i*randn(Nsp);
+phi_turb = real(ifft2(ifftshift(cn .* sqrt(PSD))));
+phi_turb = phi_turb / std(phi_turb(:)) * pi;
+
+%% --- Laguerre-Gaussian LG_l^p (amplitude + phase) ---
+l = 1; p = 0;   % azimuthal index, radial index
+[X, Y] = meshgrid(linspace(-1,1,Nsp), linspace(-1,1,Nsp));
+R   = sqrt(X.^2 + Y.^2);
+PHI = atan2(Y, X);
+% Amplitude: R^|l| * exp(-R^2) * Laguerre_p^|l|(2R^2)  (p=0: Laguerre=1)
+A_LG = R.^abs(l) .* exp(-R.^2);
+A_LG = A_LG / max(A_LG(:));
+E_LG = A_LG .* exp(1i*l*PHI);
+
+%% --- Select target ---
+switch lower(target_mode)
+    case 'turbulence'
+        fprintf('Target: Kolmogorov turbulence (phase only)\n')
+        phi      = phi_turb;
+        Etarget  = exp(1i*phi);
+
+    case 'lg'
+        fprintf('Target: LG_%d^%d mode (amplitude + phase)\n', l, p)
+        phi      = angle(E_LG);
+        Etarget  = E_LG;              % complex amplitude, |E| varies!
+        Etarget  = Etarget / max(abs(Etarget(:)));
+
+    case 'image'
+        fprintf('Target: image (amplitude + phase)\n')
+        % Load any grayscale image as amplitude, turbulence as phase
+        % (replace 'your_image.png' with your file)
+         %img = double(rgb2gray(imread('images.png')));
+         cdata=imread('Sans titre.jpg');
+         img=double(rgb2gray((cdata)));
+         img = imresize(img, [Nsp Nsp]);
+         img = img / max(img(:));
+         Etarget = double(img).* exp(1i*phi_turb);
+       % error('Set your image path in the ''image'' case.')
+
+    otherwise
+        error('Unknown target_mode: "%s". Use ''turbulence'', ''LG'' or ''image''.', target_mode)
+end
+
+%% ========================================================
+% BUILD PHYSICAL LUT
+%
+% For each of the 2^(n^2) binary patterns:
+%   complex_block(iy2,ix2) = exp(i*phases(iy2,ix2))   if ON
+%                           = exp(i*phi_off(iy2,ix2))  if OFF
+%
+% The aperture at DC sums contributions from all pixels.
+% No zero-padding is strictly needed here (the block is already
+% small), but we keep it for numerical accuracy.
+%% ========================================================
+
+fprintf('Building physical LUT...\n')
+
+Nstates = 2^(n^2);
+Estate  = zeros(Nstates, 1);
+Bits    = false(Nstates, n^2);
+
+pad = 128;
+
+fx_lut = (-pad/2:pad/2-1) / pad;
+[FX_lut, FY_lut] = meshgrid(fx_lut, fx_lut);
+
+%% Centred aperture
+H = double(sqrt(FX_lut.^2 + FY_lut.^2) < r);
+
+%% OFF pixel complex field (fixed for all states)
+off_block = exp(1i*phi_off_map);   % n x n
+
+for s = 0:Nstates-1
+
+    bits        = logical(bitget(s, 1:n^2));
+    Bits(s+1,:) = bits;
+    block       = reshape(bits, n, n);   % ON/OFF mask
+
+    %% Direct phase assignment
+    % ON  pixels : correct superpixel phase
+    % OFF pixels : phi_off
+    complex_block = off_block;                          % start from OFF
+    complex_block(block) = exp(1i*phases(block));       % overwrite ON
+
+    %% Zero-pad and propagate
+    tmp = zeros(pad);
+    c0x = floor(pad/2 - n/2) + 1;
+    c0y = floor(pad/2 - n/2) + 1;
+    tmp(c0y:c0y+n-1, c0x:c0x+n-1) = complex_block;
+
+    F     = fftshift(fft2(tmp));
+    Ffilt = F .* H;
+    recon = ifft2(ifftshift(Ffilt));
+
+    Estate(s+1) = recon(pad/2+1, pad/2+1);
+
+end
+
+%% Normalize LUT
+Estate = Estate / max(abs(Estate));
+
+%% ========================================================
+% DISPLAY LUT
+%% ========================================================
+
+figure
+plot(real(Estate), imag(Estate), '.')
+axis equal; grid on
+xlabel('Re(E)'); ylabel('Im(E)')
+title(sprintf('Direct SLM LUT  (n=%d, r=%.3f, phi\_off=%s)', ...
+    n, r, ternary_str(use_random_off,'random','0')))
+
+%% ========================================================
+% BUILD DEVICE  (Nsp*n x Nsp*n SLM pixels)
+%% ========================================================
+
+fprintf('Building device...\n')
+
+Ndmd   = Nsp * n;
+Device = zeros(Ndmd, Ndmd);    % stores SLM phase values
+
+%% ========================================================
+% RECONSTRUCTION
+%% ========================================================
+
+Ereconstructed = zeros(Nsp, Nsp);
+
+for iy = 1:Nsp
+    for ix = 1:Nsp
+
+        target  = Etarget(iy,ix);
+        [~,idx] = min(abs(Estate - target));
+        Ereconstructed(iy,ix) = Estate(idx);
+
+        bits  = Bits(idx,:);
+        block = reshape(bits, n, n);
+
+        ys = (iy-1)*n + 1;
+        xs = (ix-1)*n + 1;
+
+        %% Fill the SLM phase map for this superpixel
+        tile = phi_off_map;               % OFF pixels
+        tile(block) = phases(block);      % ON  pixels get their phase
+
+        Device(ys:ys+n-1, xs:xs+n-1) = tile;
+
+    end
+end
+
+%% ========================================================
+% FULL FOURIER PROPAGATION
+%% ========================================================
+
+fprintf('Applying full physical propagation...\n')
+
+ComplexDevice = exp(1i*Device);
+
+Ny = size(ComplexDevice, 1);
+
+fx_full = (-Ny/2:Ny/2-1) / Ny;
+[FX_full, FY_full] = meshgrid(fx_full, fx_full);
+
+Hfull = double(sqrt(FX_full.^2 + FY_full.^2) < r);
+
+F         = fftshift(fft2(ComplexDevice));
+Ffilt     = F .* Hfull;
+ReconFull = ifft2(ifftshift(Ffilt));
+
+%% ========================================================
+% EXTRACT RECONSTRUCTED FIELD
+%% ========================================================
+
+Efinal = zeros(Nsp, Nsp);
+
+for iy = 1:Nsp
+    for ix = 1:Nsp
+        ys  = (iy-1)*n + 1;
+        xs  = (ix-1)*n + 1;
+        blk = ReconFull(ys:ys+n-1, xs:xs+n-1);
+        Efinal(iy,ix) = mean(blk(:));
+    end
+end
+
+%% ========================================================
+% FIDELITY
+%% ========================================================
+
+phi_rec = angle(Efinal);
+
+Et = Etarget(:);  Et = Et / norm(Et);
+Er = Efinal(:);   Er = Er / norm(Er);
+
+Fidelity = abs(Et'*Er)^2;
+
+fprintf('\n')
+fprintf('=====================================\n')
+fprintf('n         = %d  (%d pixels/superpixel)\n', n, n^2)
+fprintf('r         = %.4f\n', r)
+fprintf('phi_off   = %s\n', ternary_str(use_random_off,'random','0'))
+fprintf('Fidelity  = %.5f\n', Fidelity)
+fprintf('=====================================\n')
+
+%% ========================================================
+% DISPLAY
+%% ========================================================
+
+figure('Position',[100 100 1800 900])
+
+subplot(2,4,1)
+imagesc(abs(Etarget)); axis image; colorbar; colormap(gray)
+title('Target amplitude')
+
+subplot(2,4,2)
+imagesc(angle(Etarget)); axis image; colorbar; colormap(hsv)
+title('Target phase')
+
+subplot(2,4,3)
+imagesc(abs(Efinal)); axis image; colorbar; colormap(gray)
+title('Reconstructed amplitude')
+
+subplot(2,4,4)
+imagesc(phi_rec); axis image; colorbar; colormap(hsv)
+title('Reconstructed phase')
+
+subplot(2,4,5)
+imagesc(abs(Etarget) - abs(Efinal)/max(abs(Efinal(:)))*max(abs(Etarget(:))))
+axis image; colorbar; colormap(gray)
+title('Amplitude error')
+
+subplot(2,4,6)
+imagesc(angle(exp(1i*(angle(Etarget) - phi_rec)))); axis image; colorbar; colormap(hsv)
+title('Wrapped phase error')
+
+subplot(2,4,7)
+imagesc(Device); colormap(hsv)
+axis image; colorbar
+title('SLM device (direct phase)')
+
+subplot(2,4,8)
+plot(real(Estate), imag(Estate), '.', 'MarkerSize', 2)
+hold on
+plot(real(Etarget(:)), imag(Etarget(:)), 'r.', 'MarkerSize', 3)
+axis equal; grid on
+xlabel('Re(E)'); ylabel('Im(E)')
+legend('LUT achievable', 'Target points')
+title('Complex plane')
+
+sgtitle(sprintf('Direct SLM [%s] — n=%d — r=%.3f — Fidelity = %.4f', ...
+    target_mode, n, r, Fidelity))
+
+%% ========================================================
+% SLM MAP  (8-bit output, 256 gray levels = 256 phase values)
+%
+% The SLM accepts a grayscale image where:
+%   gray level 0   -> phase 0
+%   gray level 255 -> phase 2*pi  (or 2*pi*(255/256) depending on SLM)
+%
+% Device contains phase values in [0, 2*pi).
+% Conversion: gray = round( mod(phase, 2*pi) / (2*pi) * 255 )
+%% ========================================================
+
+SLM_map = uint8(round(mod(Device, 2*pi) / (2*pi) * 255));
+
+figure('Position',[100 100 700 700])
+imagesc(SLM_map, [0 255])
+colormap(gray)
+colorbar
+axis image
+title(sprintf('SLM map — %d x %d pixels — 8 bit (0..255)', ...
+    size(SLM_map,2), size(SLM_map,1)))
+xlabel('x [SLM pixels]')
+ylabel('y [SLM pixels]')
+
+% Zoom on one superpixel to check the 4x4 phase pattern
+figure('Position',[850 100 400 400])
+imagesc(SLM_map(1:n, 1:n), [0 255])
+colormap(gray)
+colorbar
+axis image
+title('Zoom: first superpixel (4x4 pixels)')
+for iy2 = 1:n
+    for ix2 = 1:n
+        text(ix2, iy2, num2str(SLM_map(iy2,ix2)), ...
+            'HorizontalAlignment','center', ...
+            'Color','r', 'FontWeight','bold', 'FontSize',10)
+    end
+end
+
+fprintf('\nSLM map: %d x %d pixels, uint8 [0..255]\n', ...
+    size(SLM_map,2), size(SLM_map,1))
+fprintf('Phase resolution: 2*pi / 256 = %.4f rad/level\n', 2*pi/256)
+
+% Optional: save to file
+% imwrite(SLM_map, 'SLM_map_simple.png')
+
+%% ========================================================
+% LOCAL HELPER
+%% ========================================================
+
+function s = ternary_str(cond, a, b)
+    if cond, s = a; else, s = b; end
+end
